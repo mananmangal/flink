@@ -18,7 +18,10 @@
 
 package org.apache.flink.fs.gs;
 
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.FileSystemFactory;
 import org.apache.flink.fs.gs.utils.ConfigUtils;
@@ -51,9 +54,34 @@ public class GSFileSystemFactory implements FileSystemFactory {
     public static final String SCHEME = "gs";
 
     /**
+     * The substring to be replaced by random entropy in checkpoint paths.
+     */
+    public static final ConfigOption<String> ENTROPY_INJECT_KEY_OPTION = ConfigOptions
+            .key("gs.entropy.key")
+            .noDefaultValue()
+            .withDescription(
+                    "This option can be used to improve performance due to sharding issues on GCS. "
+                            + "For file creations with entropy injection, this key will be replaced by random "
+                            + "alphanumeric characters. For other file creations, the key will be filtered out.");
+
+    /**
+     * The number of entropy characters, in case entropy injection is configured.
+     */
+    public static final ConfigOption<Integer> ENTROPY_INJECT_LENGTH_OPTION = ConfigOptions
+            .key("gs.entropy.length")
+            .defaultValue(4)
+            .withDescription("When '" + ENTROPY_INJECT_KEY_OPTION.key()
+                    + "' is set, this option defines the number of "
+                    + "random characters to replace the entropy key with.");
+
+    private static final String INVALID_ENTROPY_KEY_CHARS = "^.*[~#@*+%{}<>\\[\\]|\"\\\\].*$";
+
+    /**
      * The Hadoop, formed by combining system Hadoop config with properties defined in Flink config.
      */
     @Nullable private org.apache.hadoop.conf.Configuration hadoopConfig;
+
+    private Configuration flinkConfig;
 
     /** The options used for GSFileSystem and RecoverableWriter. */
     @Nullable private GSFileSystemOptions fileSystemOptions;
@@ -76,20 +104,21 @@ public class GSFileSystemFactory implements FileSystemFactory {
     }
 
     @Override
-    public void configure(Configuration flinkConfig) {
-        LOGGER.info("Configuring GSFileSystemFactory with Flink configuration {}", flinkConfig);
+    public void configure(Configuration config) {
+        LOGGER.info("Configuring GSFileSystemFactory with Flink configuration {}", config);
 
-        Preconditions.checkNotNull(flinkConfig);
+        Preconditions.checkNotNull(config);
+        flinkConfig = config;
 
         ConfigUtils.ConfigContext configContext = new RuntimeConfigContext();
 
         // load Hadoop config
-        this.hadoopConfig = ConfigUtils.getHadoopConfiguration(flinkConfig, configContext);
+        this.hadoopConfig = ConfigUtils.getHadoopConfiguration(config, configContext);
         LOGGER.info(
                 "Using Hadoop configuration {}", ConfigUtils.stringifyHadoopConfig(hadoopConfig));
 
         // construct file-system options
-        this.fileSystemOptions = new GSFileSystemOptions(flinkConfig);
+        this.fileSystemOptions = new GSFileSystemOptions(config);
         LOGGER.info("Using file system options {}", fileSystemOptions);
 
         // get storage credentials and construct Storage instance
@@ -107,6 +136,13 @@ public class GSFileSystemFactory implements FileSystemFactory {
 
     @Override
     public FileSystem create(URI fsUri) throws IOException {
+        Configuration flinkConfig = this.flinkConfig;
+
+        if (flinkConfig == null) {
+            LOGGER.warn(
+                    "Creating GSFileSystem without configuring the factory. All behavior will be default.");
+            flinkConfig = new Configuration();
+        }
         LOGGER.info("Creating GSFileSystem for uri {} with options {}", fsUri, fileSystemOptions);
 
         Preconditions.checkNotNull(fsUri);
@@ -115,12 +151,27 @@ public class GSFileSystemFactory implements FileSystemFactory {
         GoogleHadoopFileSystem googleHadoopFileSystem = new GoogleHadoopFileSystem();
         try {
             googleHadoopFileSystem.initialize(fsUri, hadoopConfig);
+            // load the entropy injection settings
+            String entropyInjectionKey = flinkConfig.getString(ENTROPY_INJECT_KEY_OPTION);
+            int numEntropyChars = -1;
+            if (entropyInjectionKey != null) {
+                if (entropyInjectionKey.matches(INVALID_ENTROPY_KEY_CHARS)) {
+                    throw new IllegalConfigurationException(
+                            "Invalid character in value for " + ENTROPY_INJECT_KEY_OPTION.key()
+                                    + " : " + entropyInjectionKey);
+                }
+                numEntropyChars = flinkConfig.getInteger(ENTROPY_INJECT_LENGTH_OPTION);
+                if (numEntropyChars <= 0) {
+                    throw new IllegalConfigurationException(
+                            ENTROPY_INJECT_LENGTH_OPTION.key() + " must configure a value > 0");
+                }
+            }
+            // create the file system
+            return new GSFileSystem(googleHadoopFileSystem, storage, fileSystemOptions,
+                    entropyInjectionKey, numEntropyChars);
         } catch (IOException ex) {
             throw new IOException("Failed to initialize GoogleHadoopFileSystem", ex);
         }
-
-        // create the file system
-        return new GSFileSystem(googleHadoopFileSystem, storage, fileSystemOptions);
     }
 
     /** Config context implementation used at runtime. */
